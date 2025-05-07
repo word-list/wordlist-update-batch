@@ -3,6 +3,7 @@ package tech.gaul.wordlist.updatebatch;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.stream.Collectors;
@@ -168,6 +169,26 @@ public class BatchStatusUpdater {
                             .build();
                     sqsClient.sendMessageBatch(sendMessageBatchRequest);
                 });
+
+        // Send re-request messages for any words which we did not get a response for.
+        activeWordQueries.keySet().stream()
+                .filter(word -> !updateMessages.anyMatch(message -> message.getWord().equals(word)))
+                .forEach(word -> {
+                    logger.log("Re-requesting word: " + word);
+                    UpdateWordMessage updateWordMessage = UpdateWordMessage.builder()
+                            .word(word)
+                            .build();
+                    SendMessageBatchRequest sendMessageBatchRequest = SendMessageBatchRequest.builder()
+                            .queueUrl(System.getenv("UPDATE_WORD_QUEUE_URL"))
+                            .entries(List.of(SendMessageBatchRequestEntry.builder()
+                                    .id(word)
+                                    .messageBody(objectMapper.writeValueAsString(updateWordMessage))
+                                    .build()))
+                            .build();
+                    sqsClient.sendMessageBatch(sendMessageBatchRequest);
+                });
+
+        logger.log("Batch request completed: " + activeBatchRequestId);
 
         return true;
 
