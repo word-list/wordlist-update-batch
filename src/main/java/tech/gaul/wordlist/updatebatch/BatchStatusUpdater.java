@@ -30,6 +30,7 @@ import software.amazon.awssdk.services.sqs.model.SendMessageBatchRequestEntry;
 import tech.gaul.wordlist.updatebatch.models.ActiveBatchRequest;
 import tech.gaul.wordlist.updatebatch.models.ActiveWordQuery;
 import tech.gaul.wordlist.updatebatch.models.BatchQueryResponse;
+import tech.gaul.wordlist.updatebatch.models.QueryWordMessage;
 import tech.gaul.wordlist.updatebatch.models.UpdateWordMessage;
 
 @Builder
@@ -57,7 +58,7 @@ public class BatchStatusUpdater {
      */
     private boolean doUpdateBatchStatus(String activeBatchRequestId) {
 
-        ActiveBatchRequest activeBatchRequest = dbClient.table("active-batch-requests", activeBatchRequestSchema)
+        ActiveBatchRequest activeBatchRequest = dbClient.table(System.getenv("ACTIVE_BATCHES_TABLE_NAME"), activeBatchRequestSchema)
                 .getItem(r -> r.key(k -> k.partitionValue(activeBatchRequestId)));
 
         if (activeBatchRequest == null) {
@@ -91,7 +92,7 @@ public class BatchStatusUpdater {
                         .build())
                 .build();
 
-        Map<String, ActiveWordQuery> activeWordQueries = dbClient.table("active-word-queries", activeWordQuerySchema)
+        Map<String, ActiveWordQuery> activeWordQueries = dbClient.table(System.getenv("ACTIVE_QUERIES_TABLE_NAME"), activeWordQuerySchema)
                 .scan(scanRequest)
                 .items()
                 .stream()
@@ -175,15 +176,16 @@ public class BatchStatusUpdater {
                 .filter(word -> !updateMessages.anyMatch(message -> message.getWord().equals(word)))
                 .forEach(word -> {
                     logger.log("Re-requesting word: " + word);
-                    UpdateWordMessage updateWordMessage = UpdateWordMessage.builder()
+                    QueryWordMessage queryWordMessage = QueryWordMessage.builder()
                             .word(word)
+                            .force(true) // If we made it this far, we definitely want to update the word.
                             .build();
 
                     String messageBody;
                     try {
-                        messageBody = objectMapper.writeValueAsString(updateWordMessage);
+                        messageBody = objectMapper.writeValueAsString(queryWordMessage);
                         SendMessageBatchRequest sendMessageBatchRequest = SendMessageBatchRequest.builder()
-                                .queueUrl(System.getenv("UPDATE_WORD_QUEUE_URL"))
+                                .queueUrl(System.getenv("QUERY_WORD_QUEUE_URL"))
                                 .entries(List.of(SendMessageBatchRequestEntry.builder()
                                         .id(word)
                                         .messageBody(messageBody)
@@ -207,7 +209,7 @@ public class BatchStatusUpdater {
         boolean shouldDelete = doUpdateBatchStatus(activeBatchRequestId);
         if (shouldDelete) {
             logger.log("Deleting batch request: " + activeBatchRequestId);
-            dbClient.table("active-batch-requests", activeBatchRequestSchema)
+            dbClient.table(System.getenv("ACTIVE_BATCHES_TABLE_NAME"), activeBatchRequestSchema)
                     .deleteItem(r -> r.key(k -> k.partitionValue(activeBatchRequestId)));
         }
     }
