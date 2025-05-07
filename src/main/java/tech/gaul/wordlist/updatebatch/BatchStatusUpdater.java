@@ -178,14 +178,22 @@ public class BatchStatusUpdater {
                     UpdateWordMessage updateWordMessage = UpdateWordMessage.builder()
                             .word(word)
                             .build();
-                    SendMessageBatchRequest sendMessageBatchRequest = SendMessageBatchRequest.builder()
-                            .queueUrl(System.getenv("UPDATE_WORD_QUEUE_URL"))
-                            .entries(List.of(SendMessageBatchRequestEntry.builder()
-                                    .id(word)
-                                    .messageBody(objectMapper.writeValueAsString(updateWordMessage))
-                                    .build()))
-                            .build();
-                    sqsClient.sendMessageBatch(sendMessageBatchRequest);
+
+                    String messageBody;
+                    try {
+                        messageBody = objectMapper.writeValueAsString(updateWordMessage);
+                        SendMessageBatchRequest sendMessageBatchRequest = SendMessageBatchRequest.builder()
+                                .queueUrl(System.getenv("UPDATE_WORD_QUEUE_URL"))
+                                .entries(List.of(SendMessageBatchRequestEntry.builder()
+                                        .id(word)
+                                        .messageBody(messageBody)
+                                        .build()))
+                                .build();
+                        sqsClient.sendMessageBatch(sendMessageBatchRequest);
+                    } catch (Exception e) {
+                        logger.log("Failed to convert message for word '" + word + "' to JSON.");
+                        logger.log("Error: " + e.toString());
+                    }
                 });
 
         logger.log("Batch request completed: " + activeBatchRequestId);
