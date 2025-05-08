@@ -6,10 +6,13 @@ import java.io.InputStreamReader;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.function.Function;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import com.amazonaws.services.lambda.runtime.LambdaLogger;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.openai.client.OpenAIClient;
 import com.openai.core.http.HttpResponse;
@@ -27,6 +30,8 @@ import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
 import software.amazon.awssdk.services.sqs.SqsClient;
 import software.amazon.awssdk.services.sqs.model.SendMessageBatchRequest;
 import software.amazon.awssdk.services.sqs.model.SendMessageBatchRequestEntry;
+import software.amazon.awssdk.services.sqs.model.SendMessageBatchResponse;
+import software.amazon.awssdk.services.sqs.model.SendMessageBatchResultEntry;
 import tech.gaul.wordlist.updatebatch.models.ActiveBatchRequest;
 import tech.gaul.wordlist.updatebatch.models.ActiveWordQuery;
 import tech.gaul.wordlist.updatebatch.models.BatchQueryResponse;
@@ -58,7 +63,8 @@ public class BatchStatusUpdater {
      */
     private boolean doUpdateBatchStatus(String activeBatchRequestId) {
 
-        ActiveBatchRequest activeBatchRequest = dbClient.table(System.getenv("ACTIVE_BATCHES_TABLE_NAME"), activeBatchRequestSchema)
+        ActiveBatchRequest activeBatchRequest = dbClient
+                .table(System.getenv("ACTIVE_BATCHES_TABLE_NAME"), activeBatchRequestSchema)
                 .getItem(r -> r.key(k -> k.partitionValue(activeBatchRequestId)));
 
         if (activeBatchRequest == null) {
@@ -92,7 +98,8 @@ public class BatchStatusUpdater {
                         .build())
                 .build();
 
-        Map<String, ActiveWordQuery> activeWordQueries = dbClient.table(System.getenv("ACTIVE_QUERIES_TABLE_NAME"), activeWordQuerySchema)
+        Map<String, ActiveWordQuery> activeWordQueries = dbClient
+                .table(System.getenv("ACTIVE_QUERIES_TABLE_NAME"), activeWordQuerySchema)
                 .scan(scanRequest)
                 .items()
                 .stream()
@@ -117,7 +124,7 @@ public class BatchStatusUpdater {
         BufferedReader reader = new BufferedReader(new InputStreamReader(contentResponse.body()));
 
         // Build a stream of UpdateWordMessage objects to send from the LLM response.
-        Stream<UpdateWordMessage> updateMessages = reader.lines()
+        Map<String, SendMessageBatchRequestEntry> updateWordEntries = reader.lines()
                 .map(line -> {
                     try {
                         return Optional.of(objectMapper.readValue(line, BatchQueryResponse.class));
@@ -145,58 +152,69 @@ public class BatchStatusUpdater {
                     }
                 })
                 .filter(Optional::isPresent)
-                .map(Optional::get);
+                .map(Optional::get)
+                .map(msg -> {
+                    try {
+                        return SendMessageBatchRequestEntry.builder()
+                                .id(msg.getWord())
+                                .messageBody(objectMapper.writeValueAsString(msg))
+                                .build();
+                    } catch (JsonProcessingException e) {
+                        throw new RuntimeException(e);
+                    }
+                })
+                .collect(Collectors.toMap(SendMessageBatchRequestEntry::id, Function.identity()));
 
-        // Send the update messages to the SQS queue.
-        BatchingIterator.batchedStreamOf(updateMessages, 10)
-                .forEach(batchedMessages -> {
-                    SendMessageBatchRequest sendMessageBatchRequest = SendMessageBatchRequest.builder()
-                            .queueUrl(System.getenv("UPDATE_WORD_QUEUE_URL"))
-                            .entries(batchedMessages.stream()
-                                    .map(message -> {
-                                        try {
-                                            return Optional.of(SendMessageBatchRequestEntry.builder()
-                                                    .id(message.getWord())
-                                                    .messageBody(objectMapper.writeValueAsString(message))
-                                                    .build());
-                                        } catch (Exception e) {
-                                            logger.log("Failed to serialize message: " + message);
-                                            return emptySendMessageBatchRequestEntry;
-                                        }
-                                    })
-                                    .filter(Optional::isPresent)
-                                    .map(Optional::get)
-                                    .collect(Collectors.toList()))
-                            .build();
-                    sqsClient.sendMessageBatch(sendMessageBatchRequest);
-                });
+        // Send the update messages to the SQS queue 10 at a time (current limit for
+        // batch send)
+        int batchSize = 10;
+        while (!updateWordEntries.isEmpty()) {
+            List<SendMessageBatchRequestEntry> batchedUpdateWordEntries = updateWordEntries.values()
+                    .stream()
+                    .limit(batchSize)
+                    .collect(Collectors.toList());
+
+            SendMessageBatchResponse response = sqsClient.sendMessageBatch(m -> m
+                    .queueUrl(System.getenv("UPDATE_WORD_QUEUE_URL"))
+                    .entries(batchedUpdateWordEntries));
+
+            response.successful().stream().map(SendMessageBatchResultEntry::id).forEach(updateWordEntries::remove);
+        }
 
         // Send re-request messages for any words which we did not get a response for.
-        activeWordQueries.keySet().stream()
-                .filter(word -> !updateMessages.anyMatch(message -> message.getWord().equals(word)))
-                .forEach(word -> {
-                    logger.log("Re-requesting word: " + word);
-                    QueryWordMessage queryWordMessage = QueryWordMessage.builder()
-                            .word(word)
-                            .force(true) // If we made it this far, we definitely want to update the word.
-                            .build();
-
-                    String messageBody;
+        Map<String, SendMessageBatchRequestEntry> queryWordEntries = activeWordQueries.keySet().stream()
+                .filter(Predicate.not(updateWordEntries::containsKey))
+                .map(word -> QueryWordMessage.builder()
+                        .word(word)
+                        .force(true) // If we made it this far, we definitely want to update the word.
+                        .build())
+                .map(msg -> {
                     try {
-                        messageBody = objectMapper.writeValueAsString(queryWordMessage);
-                        SendMessageBatchRequest sendMessageBatchRequest = SendMessageBatchRequest.builder()
-                                .queueUrl(System.getenv("QUERY_WORD_QUEUE_URL"))
-                                .entries(List.of(SendMessageBatchRequestEntry.builder()
-                                        .id(word)
-                                        .messageBody(messageBody)
-                                        .build()))
-                                .build();
-                        sqsClient.sendMessageBatch(sendMessageBatchRequest);
+                        return Optional.of(SendMessageBatchRequestEntry.builder()
+                                .id(msg.getWord())
+                                .messageBody(objectMapper.writeValueAsString(msg))
+                                .build());
                     } catch (Exception e) {
-                        logger.log("Failed to convert message for word '" + word + "' to JSON.");
-                        logger.log("Error: " + e.toString());
+                        logger.log("Failed to create JSON message for " + msg.getWord());
+                        return emptySendMessageBatchRequestEntry;
                     }
-                });
+                })
+                .filter(Optional::isPresent)
+                .map(Optional::get)
+                .collect(Collectors.toMap(SendMessageBatchRequestEntry::id, Function.identity()));
+
+        while (!queryWordEntries.isEmpty()) {
+            List<SendMessageBatchRequestEntry> batchedQueryWordEntries = queryWordEntries.values()
+                    .stream()
+                    .limit(batchSize)
+                    .collect(Collectors.toList());
+
+            SendMessageBatchResponse response = sqsClient.sendMessageBatch(m -> m
+                    .queueUrl(System.getenv("QUERY_WORD_QUEUE_URL"))
+                    .entries(batchedQueryWordEntries));
+
+            response.successful().stream().map(SendMessageBatchResultEntry::id).forEach(updateWordEntries::remove);
+        }
 
         logger.log("Batch request completed: " + activeBatchRequestId);
 
