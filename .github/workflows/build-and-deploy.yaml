@@ -24,8 +24,14 @@ jobs:
           distribution: 'temurin'
           java-version: '21'
 
-      - name: Build with Maven
-        run: mvn clean package
+      - name: Maven clean
+        run: mvn clean
+
+      - name: Update pom.xml version
+        run: mvn -B versions:set -DnewVersion=${{ github.event.release.tag_name }} -DgenerateBackupPoms=false
+
+      - name: Package
+        run: mvn package
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -47,7 +53,7 @@ jobs:
       - name: Upload jar to S3
         id: upload
         run: |
-          JAR_FILE=$(find target -name "*.jar" | head -n 1)
+          JAR_FILE=$(ls -t target/*.jar | head -n 1)
           aws s3 cp "$JAR_FILE" s3://${{ vars.S3_BUCKET_NAME }}/
           echo "jar_file=$JAR_FILE" >> "$GITHUB_OUTPUT"        
 
